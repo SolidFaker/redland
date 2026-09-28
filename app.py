@@ -273,6 +273,305 @@ def app_verify():
     return result
 
 
+# ---------------------------------------------------------------- auto reserve tasks
+
+import collections  # noqa: E402
+
+TASKS_FILE = os.path.join(DATA_DIR, "tasks.json")
+TASK_LOG_FILE = os.path.join(DATA_DIR, "task_logs.jsonl")
+_task_lock = threading.RLock()
+_task_logs = collections.deque(maxlen=800)
+_scheduler_started = False
+
+
+def load_tasks():
+    if os.path.exists(TASKS_FILE):
+        try:
+            with open(TASKS_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                return data
+        except Exception:  # noqa: BLE001
+            pass
+    return []
+
+
+def save_tasks(tasks):
+    with open(TASKS_FILE, "w", encoding="utf-8") as f:
+        json.dump(tasks, f, ensure_ascii=False, indent=2)
+
+
+def task_log(task_id, msg):
+    entry = {"ts": int(time.time() * 1000), "task": task_id, "msg": msg}
+    _task_logs.append(entry)
+    try:
+        with open(TASK_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+    print(f"[task:{task_id}] {msg}", flush=True)
+
+
+def _walk_dicts(obj):
+    stack = [obj]
+    while stack:
+        cur = stack.pop()
+        if isinstance(cur, dict):
+            yield cur
+            stack.extend(cur.values())
+        elif isinstance(cur, list):
+            stack.extend(cur)
+
+
+def parse_sessions(detail_data):
+    out, seen = [], set()
+    for node in _walk_dicts(detail_data or {}):
+        key = next((k for k in node if k.lower() in ("session_id", "sessionid")), None)
+        if not key:
+            continue
+        sid = node.get(key)
+        if not sid or str(sid) in seen:
+            continue
+        seen.add(str(sid))
+        out.append(
+            {
+                "session_id": sid,
+                "date": node.get("date") or node.get("arrive_date") or node.get("date_text"),
+                "start": node.get("start_time") or node.get("start_text") or node.get("begin_time"),
+                "end": node.get("end_time") or node.get("end_text") or node.get("finish_time"),
+                "status": node.get("status") or node.get("session_status"),
+                "raw": node,
+            }
+        )
+    return out
+
+
+def _app_post(uri, payload):
+    headers = app_api_headers()
+    if not headers:
+        raise RuntimeError("未导入 App 身份令牌")
+    headers = {**headers, "Content-Type": "application/json"}
+    return requests.post(REDLAND_API + uri, headers=headers,
+                         data=json.dumps(payload, ensure_ascii=False), timeout=20)
+
+
+def _web_signed(account_key, uri, payload=None, method="POST"):
+    from xhs_utils.xhs_pc.params import build_pc_login_headers  # noqa: PLC0415
+
+    store = load_accounts()
+    acc = store.get("accounts", {}).get(account_key)
+    if not acc:
+        raise RuntimeError(f"账号不存在: {account_key}")
+    cookies = dict(acc["cookies"])
+    client = XHSLoginApi()
+    headers, data = client._signed_request_params(
+        cookies, uri, payload or "", method=method, tier="0301", mns_profile="qrcode_poll"
+    )
+    headers = build_pc_login_headers(
+        headers, client._cookies_for_url(client.base_url, cookies),
+        kind="post" if method == "POST" else "get",
+    )
+    if method == "POST":
+        return client.http.post(client.base_url + uri, headers=headers, data=data,
+                                proxies=None, timeout=20)
+    return client.http.get(client.base_url + uri, headers=headers, proxies=None, timeout=20)
+
+
+def _fetch_activity_status(ip_no):
+    r = requests.get(
+        REDLAND_API + "2026_reserve_ip_activity_list",
+        params={"ip_no": ip_no},
+        headers={"User-Agent": _UA_DESKTOP},
+        timeout=15,
+    )
+    return (r.json().get("data") or {})
+
+
+def _choose_session(sessions, task):
+    def match(sess):
+        text = " ".join(str(sess.get(k) or "") for k in ("date", "start", "end"))
+        if task.get("date_hint") and task["date_hint"] not in text:
+            return False
+        if task.get("session_hint") and task["session_hint"] not in text:
+            return False
+        return True
+
+    preferred = [s for s in sessions if match(s)]
+    return (preferred or sessions or [None])[0]
+
+
+def run_task_cycle(task, live_override=None):
+    """执行一轮预约尝试；返回 (status, message)。"""
+    tid = task["id"]
+    ip_no = task.get("ip_no")
+    aid = task.get("activity_id")
+    mode = live_override or task.get("mode") or "dry_run"
+    identity = task.get("identity") or "auto"
+
+    data = _fetch_activity_status(ip_no)
+    acts = data.get("activities") or []
+    act = next((a for a in acts if a.get("activity_id") == aid), None)
+    if not act:
+        return "failed", f"未找到活动 activity_id={aid}"
+    button = act.get("reserve_button")
+    task_log(tid, f"状态: {act.get('activity_name')} -> {button} {act.get('reserve_start_text') or ''}")
+    if button == "ENDED":
+        return "failed", "活动已结束"
+    if button == "SOLD_OUT":
+        return "failed", "已约满"
+
+    detail = None
+    try:
+        if identity in ("app", "auto") and app_api_headers():
+            r = app_api_get("2026_reserve_activity_detail", {"activity_id": aid})
+        else:
+            key = task.get("account_key") or (load_accounts().get("current") or "")
+            r = _web_signed(key, f"/api/sns/v1/activity_platform/redland/2026_reserve_activity_detail?activity_id={aid}",
+                            method="GET")
+        detail = r.json()
+        task_log(tid, f"详情 HTTP {r.status_code}: {str(detail)[:400]}")
+    except Exception as exc:  # noqa: BLE001
+        task_log(tid, f"详情请求失败: {exc}")
+
+    sessions = parse_sessions((detail or {}).get("data") or {})
+    if not sessions:
+        sessions = parse_sessions(detail or {})
+    if not sessions:
+        return "failed", "未解析到场次（接口未返回 sessionId，见日志）"
+    sess = _choose_session(sessions, task)
+    sid = sess["session_id"]
+    task_log(tid, f"选择场次: {sess.get('date')} {sess.get('start')}-{sess.get('end')} sessionId={sid}")
+
+    if mode == "dry_run":
+        return "dry_run", f"[演练] 目标场次 sessionId={sid}，未提交"
+
+    try:
+        if identity in ("app", "auto") and app_api_headers():
+            resp = _app_post("2026_reserve", {"sessionId": sid})
+            who = "app"
+        else:
+            key = task.get("account_key") or (load_accounts().get("current") or "")
+            resp = _web_signed(key, "/api/sns/v1/activity_platform/redland/2026_reserve",
+                               {"sessionId": sid}, method="POST")
+            who = f"web:{key}"
+    except Exception as exc:  # noqa: BLE001
+        return "failed", f"提交异常: {exc}"
+
+    body = (resp.text or "")[:400]
+    task_log(tid, f"提交({who}) HTTP {resp.status_code}: {body}")
+    try:
+        j = resp.json()
+    except ValueError:
+        return "failed", f"提交返回非 JSON: {body}"
+    if j.get("success") and j.get("code") == 0:
+        if j.get("data"):
+            return "success", f"提交成功: {str(j.get('data'))[:200]}"
+        return "failed", f"提交返回成功但无数据（可能被风控/参数不完整）: {body}"
+    return "failed", f"提交失败: {j.get('msg') or body}"
+
+
+def _task_thread(task, live_override=None, manual=False):
+    tid = task["id"]
+
+    def worker():
+        dry = (live_override or task.get("mode")) == "dry_run"
+        try:
+            for attempt in range(1, int(task.get("max_attempts") or 20) + 1):
+                with _task_lock:
+                    tasks = load_tasks()
+                    cur = next((t for t in tasks if t["id"] == tid), None)
+                    if not cur or (not manual and not cur.get("enabled")):
+                        task_log(tid, "任务被暂停/删除，停止")
+                        return
+                    cur["state"] = "running"
+                    cur["attempts"] = attempt
+                    save_tasks(tasks)
+                status, msg = run_task_cycle(task, live_override=live_override)
+                with _task_lock:
+                    tasks = load_tasks()
+                    cur = next((t for t in tasks if t["id"] == tid), None)
+                    if cur:
+                        if status == "success":
+                            new_state = "success"
+                        elif status == "dry_run":
+                            new_state = "dry_run"
+                        else:
+                            new_state = "failed" if (dry or attempt >= int(task.get("max_attempts") or 20)) else "waiting"
+                        cur["last_msg"] = msg
+                        cur["state"] = new_state
+                        cur["updated_at"] = int(time.time())
+                        save_tasks(tasks)
+                if status in ("success", "dry_run", "failed"):
+                    if dry:
+                        return
+                    if status != "failed":
+                        return
+                    if attempt >= int(task.get("max_attempts") or 20):
+                        return
+                time.sleep(max(0.2, (task.get("retry_interval_ms") or 400) / 1000.0))
+        finally:
+            with _task_lock:
+                tasks = load_tasks()
+                cur = next((t for t in tasks if t["id"] == tid), None)
+                if cur and cur.get("state") == "running":
+                    cur["state"] = "waiting"
+                    save_tasks(tasks)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def _refresh_fire_at():
+    cache = {}
+    for task in load_tasks():
+        if not task.get("enabled"):
+            continue
+        ip_no = task.get("ip_no")
+        try:
+            if ip_no not in cache:
+                cache[ip_no] = _fetch_activity_status(ip_no)
+            acts = cache[ip_no].get("activities") or []
+            act = next((a for a in acts if a.get("activity_id") == task.get("activity_id")), None)
+            ts = (act or {}).get("reserve_start_timestamp") or 0
+            if ts and ts != task.get("fire_at"):
+                with _task_lock:
+                    tasks = load_tasks()
+                    cur = next((t for t in tasks if t["id"] == task["id"]), None)
+                    if cur:
+                        cur["fire_at"] = ts
+                        cur["fire_at_text"] = (act or {}).get("reserve_start_text")
+                        save_tasks(tasks)
+        except Exception:  # noqa: BLE001
+            continue
+
+
+def _scheduler_loop():
+    last_refresh = 0
+    while True:
+        try:
+            now_ms = int(time.time() * 1000)
+            if now_ms - last_refresh > 15000:
+                _refresh_fire_at()
+                last_refresh = now_ms
+            for task in load_tasks():
+                if not task.get("enabled") or task.get("state") in ("running", "success"):
+                    continue
+                fire_at = task.get("fire_at") or 0
+                if fire_at and now_ms >= fire_at - int(task.get("advance_ms") or 300):
+                    task_log(task["id"], f"到达开约时间({task.get('fire_at_text') or fire_at})，开始执行")
+                    _task_thread(task)
+        except Exception as exc:  # noqa: BLE001
+            print("[scheduler]", exc, flush=True)
+        time.sleep(0.3)
+
+
+def start_scheduler():
+    global _scheduler_started
+    if _scheduler_started:
+        return
+    _scheduler_started = True
+    threading.Thread(target=_scheduler_loop, daemon=True).start()
+
+
 # ---------------------------------------------------------------- ticket bind
 
 TICKET_ID_TYPES = {
@@ -349,6 +648,7 @@ def fetch_reserve_list():
             rows.append(
                 {
                     "booth_no": x.get("booth_no"),
+                    "ip_no": x.get("ip_no"),
                     "ip_name": x.get("ip_name"),
                     "activity_id": a.get("activity_id"),
                     "activity_name": a.get("activity_name"),
@@ -655,6 +955,126 @@ def api_reserve_list():
         return jsonify({"ok": False, "msg": str(exc)}), 502
 
 
+@app.get("/api/tasks")
+def api_tasks():
+    tasks = load_tasks()
+    now = int(time.time() * 1000)
+    out = []
+    for t in tasks:
+        fire_at = t.get("fire_at") or 0
+        out.append(
+            {
+                **t,
+                "countdown_ms": max(0, fire_at - now) if fire_at else None,
+            }
+        )
+    return jsonify({"ok": True, "tasks": out})
+
+
+@app.post("/api/tasks")
+def api_tasks_create():
+    body = request.get_json(silent=True) or {}
+    ip_no = str(body.get("ip_no") or "")
+    activity_id = body.get("activity_id")
+    if not ip_no or not activity_id:
+        return jsonify({"ok": False, "msg": "缺少 ip_no / activity_id"}), 400
+    with _task_lock:
+        tasks = load_tasks()
+        task = {
+            "id": f"t{int(time.time() * 1000) % 10 ** 9}",
+            "ip_no": ip_no,
+            "activity_id": activity_id,
+            "booth_no": body.get("booth_no"),
+            "ip_name": body.get("ip_name"),
+            "activity_name": body.get("activity_name"),
+            "date_hint": body.get("date_hint") or "",
+            "session_hint": body.get("session_hint") or "",
+            "advance_ms": int(body.get("advance_ms") or 300),
+            "retry_interval_ms": int(body.get("retry_interval_ms") or 400),
+            "max_attempts": int(body.get("max_attempts") or 20),
+            "identity": body.get("identity") or "auto",
+            "account_key": body.get("account_key") or None,
+            "mode": body.get("mode") or "dry_run",
+            "enabled": False,
+            "state": "waiting",
+            "attempts": 0,
+            "last_msg": "",
+            "fire_at": 0,
+            "fire_at_text": "",
+            "created_at": int(time.time()),
+        }
+        tasks.append(task)
+        save_tasks(tasks)
+    try:
+        data = _fetch_activity_status(ip_no)
+        act = next((a for a in (data.get("activities") or []) if a.get("activity_id") == activity_id), None)
+        if act:
+            with _task_lock:
+                tasks = load_tasks()
+                cur = next((t for t in tasks if t["id"] == task["id"]), None)
+                if cur:
+                    cur["fire_at"] = act.get("reserve_start_timestamp") or 0
+                    cur["fire_at_text"] = act.get("reserve_start_text") or ""
+                    save_tasks(tasks)
+                    task = cur
+    except Exception:  # noqa: BLE001
+        pass
+    return jsonify({"ok": True, "task": task})
+
+
+@app.post("/api/tasks/<tid>/update")
+def api_tasks_update(tid):
+    body = request.get_json(silent=True) or {}
+    allowed = {"mode", "identity", "account_key", "advance_ms", "retry_interval_ms",
+               "max_attempts", "date_hint", "session_hint", "enabled"}
+    with _task_lock:
+        tasks = load_tasks()
+        cur = next((t for t in tasks if t["id"] == tid), None)
+        if not cur:
+            return jsonify({"ok": False, "msg": "任务不存在"}), 404
+        for k, v in body.items():
+            if k in allowed:
+                cur[k] = v
+        if body.get("enabled") is True:
+            cur["state"] = "waiting"
+            cur["attempts"] = 0
+            cur["last_msg"] = ""
+        save_tasks(tasks)
+    return jsonify({"ok": True, "task": cur})
+
+
+@app.post("/api/tasks/<tid>/delete")
+def api_tasks_delete(tid):
+    with _task_lock:
+        tasks = load_tasks()
+        tasks = [t for t in tasks if t["id"] != tid]
+        save_tasks(tasks)
+    return jsonify({"ok": True})
+
+
+@app.post("/api/tasks/<tid>/run")
+def api_tasks_run(tid):
+    body = request.get_json(silent=True) or {}
+    live = bool(body.get("live"))
+    tasks = load_tasks()
+    task = next((t for t in tasks if t["id"] == tid), None)
+    if not task:
+        return jsonify({"ok": False, "msg": "任务不存在"}), 404
+    if task.get("state") == "running":
+        return jsonify({"ok": False, "msg": "任务正在执行"}), 409
+    task_log(tid, f"手动{'正式' if live else '演练'}执行")
+    _task_thread(task, live_override="live" if live else "dry_run", manual=True)
+    return jsonify({"ok": True})
+
+
+@app.get("/api/tasks/logs")
+def api_tasks_logs():
+    tid = request.args.get("task")
+    limit = int(request.args.get("limit") or 120)
+    logs = [e for e in _task_logs if not tid or e["task"] == tid]
+    return jsonify({"ok": True, "logs": logs[-limit:]})
+
+
 @app.post("/api/ticket")
 def api_ticket_save():
     body = request.get_json(silent=True) or {}
@@ -805,6 +1225,8 @@ def main():
             print(f"[session] 当前账号有效：{user.get('nickname')}（{user.get('red_id')}）", flush=True)
         else:
             print(f"[session] 当前账号失效：{(verified or {}).get('reason')}", flush=True)
+    start_scheduler()
+    print("[scheduler] 自动预约任务引擎已启动", flush=True)
     app.run(host=args.host, port=args.port, threaded=True)
 
 

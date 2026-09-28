@@ -91,6 +91,19 @@
   .rs-SOLD_OUT { color: #999; white-space: nowrap; }
   .rs-ENDED { color: #c3c7cd; white-space: nowrap; }
 
+  .task { border: 1px solid var(--line); border-radius: 10px; padding: 10px; margin-bottom: 8px; }
+  .task .tname { font-size: 13px; font-weight: 600; display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+  .task .tmeta { font-size: 11.5px; color: var(--sub); margin-top: 4px; line-height: 1.7; }
+  .task .tops { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; align-items: center; }
+  .task select, .task input { height: 28px; border: 1px solid #dfe2e7; border-radius: 8px;
+        font-size: 12px; padding: 0 8px; background: #fff; }
+  .task input { width: 104px; }
+  .task .state-waiting { background: #f2f3f5; color: #666; }
+  .task .state-running { background: #fff7e6; color: #e6a23c; }
+  .task .state-success { background: #e8f7ee; color: #2e9e5b; }
+  .task .state-failed { background: #ffecef; color: var(--red); }
+  .task .state-dry_run { background: #eef4ff; color: #3b73d1; }
+
   .filters { display: flex; gap: 8px; align-items: center; margin-bottom: 10px; flex-wrap: wrap; }
   .filters input { flex: 1; min-width: 150px; height: 32px; border: 1px solid #dfe2e7;
         border-radius: 16px; padding: 0 12px; font-size: 13px; }
@@ -134,7 +147,6 @@
         <button id="checkAllBtn" class="mini ghost" disabled>全部查票</button>
       </div>
       <div id="list"><div class="empty">暂无账号，点右上角「添加账号」扫码</div></div>
-      <div class="acts" id="acts"></div>
     </section>
 
     <section class="panel">
@@ -185,11 +197,22 @@
       <div class="tablewrap">
         <table class="rtable">
           <thead><tr>
-            <th>展位</th><th>IP</th><th>活动</th><th>日期</th><th>状态</th><th>开约时间</th><th>预约页</th>
+            <th>展位</th><th>IP</th><th>活动</th><th>日期</th><th>状态</th><th>开约时间</th><th>预约页</th><th>任务</th>
           </tr></thead>
           <tbody id="rsBody"></tbody>
         </table>
       </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>自动预约任务</h2>
+        <span class="hint">到开约时间自动提交；演练模式只跑到提交前一步</span>
+        <div class="spacer"></div>
+        <button id="taskRefresh" class="mini ghost">刷新</button>
+      </div>
+      <div id="taskList"><div class="empty">暂无任务，在「预约列表」里点「加任务」</div></div>
+      <div class="acts" id="taskLogs"></div>
     </section>
 
     <section class="panel">
@@ -371,11 +394,6 @@ async function loadRedland() {
     setStatus(j.has_ticket ? 'confirmed' : 'error',
       (j.nickname || '') + (j.has_ticket ? '：已绑定门票，可预约' : '：未绑定门票'));
     if (currentKey) setTicketBadge(currentKey, j.has_ticket ? '已绑票' : '无票', j.has_ticket);
-    if (j.activities && j.activities.length) {
-      $('acts').innerHTML = j.activities.map(a =>
-        '<div>' + a.name + ' · ' + a.button + (a.start_text ? ' · ' + a.start_text : '') + '</div>'
-      ).join('');
-    }
   } catch (e) {
     setStatus('error', '查询预约接口失败：' + e.message);
   }
@@ -389,7 +407,6 @@ async function fetchQr() {
   clearInterval(timer);
   $('refresh').disabled = true;
   setStatus('pending', '正在生成二维码…');
-  $('acts').innerHTML = '';
   try {
     const r = await fetch('/api/login/qr', { method: 'POST' });
     const j = await r.json();
@@ -543,6 +560,14 @@ function renderBindEvents(events) {
 /* ---------------- reserve list ---------------- */
 let rsRows = [];
 let rsFilter = 'all';
+let rsMap = {};
+
+function fmtMs(ms) {
+  if (ms == null) return '-';
+  const s = Math.max(0, Math.floor(ms / 1000));
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), ss = s % 60;
+  return (h ? h + '时' : '') + m + '分' + String(ss).padStart(2, '0') + '秒';
+}
 
 function rsStatusText(b) {
   return { NOT_START: '未开始', RESERVE: '可预约', SOLD_OUT: '已约满', ENDED: '已结束' }[b] || b || '-';
@@ -559,15 +584,21 @@ function rsMatch(row) {
 
 function renderReserveList() {
   const rows = rsRows.filter(rsMatch);
-  $('rsBody').innerHTML = rows.map(r => `<tr>
-    <td>${r.booth_no || ''}</td>
-    <td>${r.ip_name || ''}</td>
-    <td title="${(r.activity_desc || '').replace(/"/g, '')}">${r.activity_name || ''}</td>
-    <td>${r.date_text || ''}</td>
-    <td class="rs-${r.reserve_button || ''}">${rsStatusText(r.reserve_button)}</td>
-    <td>${r.reserve_start_text || ''}</td>
-    <td>${r.jump_url ? '<a href="' + r.jump_url + '" target="_blank">打开</a>' : ''}</td>
-  </tr>`).join('') || '<tr><td colspan="7" style="color:#b6bac2">没有匹配项</td></tr>';
+  rsMap = {};
+  $('rsBody').innerHTML = rows.map(r => {
+    const key = (r.ip_no || '') + '|' + r.activity_id;
+    rsMap[key] = r;
+    return `<tr>
+      <td>${r.booth_no || ''}</td>
+      <td>${r.ip_name || ''}</td>
+      <td title="${(r.activity_desc || '').replace(/"/g, '')}">${r.activity_name || ''}</td>
+      <td>${r.date_text || ''}</td>
+      <td class="rs-${r.reserve_button || ''}">${rsStatusText(r.reserve_button)}</td>
+      <td>${r.reserve_start_text || ''}</td>
+      <td>${r.jump_url ? '<a href="' + r.jump_url + '" target="_blank">打开</a>' : ''}</td>
+      <td><button class="mini ghost addtask" data-key="${key}">加任务</button></td>
+    </tr>`;
+  }).join('') || '<tr><td colspan="8" style="color:#b6bac2">没有匹配项</td></tr>';
 }
 
 function setRsFilter(name) {
@@ -596,6 +627,144 @@ async function loadReserveList() {
     $('rsStatus').textContent = '加载失败：' + e.message;
   }
 }
+
+/* ---------------- auto reserve tasks ---------------- */
+let taskPrevStates = {};
+
+function notify(title, body) {
+  try { if (window.Notification && Notification.permission === 'granted') new Notification(title, { body: body || '' }); } catch (e) {}
+  setStatus('confirmed', title + (body ? ' · ' + body : ''));
+}
+
+async function loadTasks() {
+  const r = await fetch('/api/tasks');
+  const j = await r.json();
+  const tasks = j.tasks || [];
+  if (!tasks.length) {
+    $('taskList').innerHTML = '<div class="empty">暂无任务，在「预约列表」里点「加任务」</div>';
+    return;
+  }
+  const stateText = { waiting: '等待', running: '执行中', success: '成功', failed: '失败', dry_run: '演练完成' };
+  $('taskList').innerHTML = tasks.map(t => `
+    <div class="task">
+      <div class="tname">${t.booth_no || ''} ${t.activity_name || ''}
+        <span class="badge state-${t.state || 'waiting'}">${stateText[t.state] || t.state || '-'}</span>
+        <span class="badge ${t.mode === 'live' ? 'bad' : 'ok'}">${t.mode === 'live' ? '正式' : '演练'}</span>
+        ${t.enabled ? '<span class="badge ok">已启用</span>' : '<span class="badge">已暂停</span>'}
+      </div>
+      <div class="tmeta">开约：${t.fire_at_text || (t.fire_at ? new Date(t.fire_at).toLocaleString('zh-CN', { hour12: false }) : '未获取到（可能已开约）')} · 倒计时 ${fmtMs(t.countdown_ms)} ·
+        尝试 ${t.attempts || 0}/${t.max_attempts || 20}
+        ${t.last_msg ? '<br>最近：' + t.last_msg : ''}</div>
+      <div class="tops">
+        <select class="t-mode" data-id="${t.id}">
+          <option value="dry_run" ${t.mode !== 'live' ? 'selected' : ''}>演练</option>
+          <option value="live" ${t.mode === 'live' ? 'selected' : ''}>正式</option>
+        </select>
+        <select class="t-identity" data-id="${t.id}">
+          <option value="auto" ${t.identity === 'auto' ? 'selected' : ''}>自动（优先 App 令牌）</option>
+          <option value="app" ${t.identity === 'app' ? 'selected' : ''}>App 令牌</option>
+          <option value="web" ${t.identity === 'web' ? 'selected' : ''}>当前账号</option>
+        </select>
+        <input class="t-date" data-id="${t.id}" placeholder="日期(可选)" value="${t.date_hint || ''}">
+        <input class="t-session" data-id="${t.id}" placeholder="时段(可选)" value="${t.session_hint || ''}">
+        <button class="mini ghost t-save" data-id="${t.id}">保存</button>
+        <button class="mini t-toggle" data-id="${t.id}" data-enabled="${t.enabled ? 1 : 0}">${t.enabled ? '暂停' : '启用'}</button>
+        <button class="mini ghost t-dry" data-id="${t.id}">演练</button>
+        <button class="mini ghost t-live" data-id="${t.id}">正式执行</button>
+        <button class="mini ghost t-logs" data-id="${t.id}">日志</button>
+        <button class="mini ghost t-del" data-id="${t.id}">删除</button>
+      </div>
+    </div>`).join('');
+
+  tasks.forEach(t => {
+    const prev = taskPrevStates[t.id];
+    if (prev && prev !== t.state && ['success', 'failed', 'dry_run'].includes(t.state)) {
+      const label = t.state === 'success' ? '预约成功' : t.state === 'failed' ? '任务失败' : '演练完成';
+      notify(label + '：' + (t.activity_name || ''), t.last_msg || '');
+    }
+    taskPrevStates[t.id] = t.state;
+  });
+}
+
+async function taskUpdate(id, payload) {
+  await fetch(`/api/tasks/${id}/update`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+  });
+  await loadTasks();
+}
+
+async function taskRun(id, live) {
+  if (live && !confirm('正式执行会真实提交预约，确认执行？')) return;
+  if (!live && !confirm('演练执行：会请求活动详情并解析场次，但不会提交。确认？')) return;
+  const r = await fetch(`/api/tasks/${id}/run`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ live }),
+  });
+  const j = await r.json();
+  if (!j.ok) alert(j.msg || '执行失败');
+  await loadTasks();
+}
+
+async function taskDelete(id) {
+  if (!confirm('删除该任务？')) return;
+  await fetch(`/api/tasks/${id}/delete`, { method: 'POST' });
+  await loadTasks();
+}
+
+async function showTaskLogs(id) {
+  const r = await fetch('/api/tasks/logs?task=' + id + '&limit=100');
+  const j = await r.json();
+  $('taskLogs').innerHTML = (j.logs || []).map(e =>
+    '<div>[' + new Date(e.ts).toLocaleTimeString('zh-CN', { hour12: false }) + '] ' + e.msg + '</div>'
+  ).join('') || '<div>暂无日志</div>';
+}
+
+async function addTask(row, btn) {
+  btn.disabled = true;
+  const r = await fetch('/api/tasks', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      ip_no: row.ip_no, activity_id: row.activity_id, booth_no: row.booth_no,
+      ip_name: row.ip_name, activity_name: row.activity_name,
+    }),
+  });
+  const j = await r.json();
+  btn.disabled = false;
+  if (!j.ok) { alert(j.msg || '创建失败'); return; }
+  btn.textContent = '已加入';
+  await loadTasks();
+}
+
+$('rsBody').addEventListener('click', (e) => {
+  const btn = e.target.closest('.addtask');
+  if (!btn) return;
+  const row = rsMap[btn.dataset.key];
+  if (row) addTask(row, btn);
+});
+
+$('taskList').addEventListener('click', async (e) => {
+  const b = e.target.closest('button');
+  if (!b || !b.dataset.id) return;
+  const id = b.dataset.id;
+  if (b.classList.contains('t-save')) {
+    const el = b.closest('.task');
+    await taskUpdate(id, {
+      mode: el.querySelector('.t-mode').value,
+      identity: el.querySelector('.t-identity').value,
+      date_hint: el.querySelector('.t-date').value.trim(),
+      session_hint: el.querySelector('.t-session').value.trim(),
+    });
+    try { Notification.requestPermission(); } catch (e2) {}
+  } else if (b.classList.contains('t-toggle')) {
+    const enable = b.dataset.enabled === '0';
+    if (enable) { try { await Notification.requestPermission(); } catch (e2) {} }
+    await taskUpdate(id, { enabled: enable });
+  } else if (b.classList.contains('t-dry')) await taskRun(id, false);
+  else if (b.classList.contains('t-live')) await taskRun(id, true);
+  else if (b.classList.contains('t-logs')) await showTaskLogs(id);
+  else if (b.classList.contains('t-del')) await taskDelete(id);
+});
+
+$('taskRefresh').onclick = () => loadTasks();
 
 /* ---------------- events ---------------- */
 $('addBtn').onclick = () => { openQrModal(); $('refresh').style.display = 'block'; fetchQr(); };
@@ -626,7 +795,9 @@ $('rsSearch').oninput = () => renderReserveList();
   await loadTicket();
   await loadLastCapture();
   await loadReserveList();
+  await loadTasks();
   setInterval(loadReserveList, 60000);
+  setInterval(loadTasks, 2000);
 })();
 </script>
 </body>
