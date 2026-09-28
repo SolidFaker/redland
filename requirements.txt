@@ -1,0 +1,6 @@
+curl_cffi==0.15.0
+loguru
+qrcode[pil]
+flask
+python-dotenv
+requests

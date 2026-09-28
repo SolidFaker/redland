@@ -1,0 +1,17 @@
+# 用户数据（登录凭证 / 门票信息 / 抓包记录 / 日志）—— 切勿提交
+data/
+
+# Python
+venv/
+__pycache__/
+*.py[cod]
+
+# 第三方依赖（由 setup.sh 自动克隆，MIT）
+vendor/
+
+# 日志与抓包文件
+*.log
+*.mitm
+
+# macOS
+.DS_Store
